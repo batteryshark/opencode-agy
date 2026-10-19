@@ -1,0 +1,22 @@
+{
+  "name": "opencode-agy",
+  "version": "0.1.0",
+  "description": "Local OpenAI-compatible endpoint backed by Google's Antigravity CLI (agy), with harness tools bridged over MCP",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "bin": {
+    "opencode-agy": "bin/opencode-agy.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node bin/opencode-agy.js serve",
+    "test": "node --test test/*.test.js"
+  },
+  "files": [
+    "bin",
+    "src"
+  ]
+}
