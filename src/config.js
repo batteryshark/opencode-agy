@@ -69,6 +69,10 @@ export const config = {
   get maxProcesses() {
     return num("OPENCODE_AGY_MAX_PROCS", 6, 1);
   },
+  /** Completed, fully consumed owned turns only; 0 disables automatic release. */
+  get idleReleaseMs() {
+    return num("OPENCODE_AGY_IDLE_RELEASE_MS", 60_000, 0);
+  },
   /** Cap for prior-conversation transcripts injected into a fresh conversation. */
   get historyMaxChars() {
     return num("OPENCODE_AGY_HISTORY_MAX_CHARS", 200_000, 0);

@@ -8,6 +8,8 @@ A matching tool result resumes a parked process. Retrying the same request re-em
 
 The resident pool defaults to six processes. It evicts the least recently used idle process, or a parked one if necessary; running turns aren't evicted. Calls are serialized unless batching is enabled. A parked-call timeout returns a tool error and drains the remaining turn. A client disconnect during a running turn stops that session's process.
 
+A successfully completed, fully consumed turn can release its owned child after 60 seconds, checked on a five-second maintenance sweep. Release requires the exact completed process/generation and no queued or active work, tools, consumer, lease or uncertain state. Any active chat request, including an incomplete body or open response stream, conservatively defers releases across the pool. Idle status alone is not completion evidence. Release sends TERM once, never escalates to KILL, and retains ownership/capacity while awaiting actual exit; racing requests receive a retryable 503. Conversation mappings remain available for a later resume without replaying the completed request. This doesn't establish vendor-side resource cleanup or resume guarantees.
+
 ## Sessions
 
 Header priority is `x-opencode-session-id`, `x-opencode-session`, `x-session-id`, then `x-session-affinity`. The first nonblank string is trimmed and capped at 200 characters. Otherwise pending tool-call IDs are used to find a parked session, then the first user message supplies a fallback hash. Title and summary detection is heuristic; those requests use ephemeral tool-less sessions.
@@ -36,6 +38,7 @@ Usage mapping combines vendor step and cumulative counters; cache reads count to
 | `OPENCODE_AGY_BIN` | `~/.local/bin/agy` | Official CLI executable |
 | `OPENCODE_AGY_TOKEN` | unset | Optional bearer authentication |
 | `OPENCODE_AGY_MAX_PROCS` | `6` | Resident process cap |
+| `OPENCODE_AGY_IDLE_RELEASE_MS` | `60000` | Completed-child idle grace; `0` disables automatic release |
 | `OPENCODE_AGY_STALL_MS` | `600000` | Stdout silence ceiling while running |
 | `OPENCODE_AGY_PARK_MS` | `1800000` | Tool-result wait ceiling |
 | `OPENCODE_AGY_INIT_TIMEOUT_MS` | `60000` | Init-event wait |

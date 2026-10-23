@@ -133,6 +133,27 @@ export class AgyProcess {
     return new Promise((resolve) => this._exitWaiters.push(resolve));
   }
 
+  /** One bounded TERM-only attempt. A timeout does NOT mean the child exited. */
+  async releaseIdle(graceMs = 2000) {
+    if (!this.child || this.exited) return this.exited;
+    if (this.idleReleaseAttempted) return false;
+    this.idleReleaseAttempted = true;
+    try {
+      process.kill(-this.child.pid, "SIGTERM");
+    } catch {
+      try { this.child.kill("SIGTERM"); } catch { /* retain ownership until exit */ }
+    }
+    return new Promise((resolve) => {
+      const done = () => { clearTimeout(timer); resolve(true); };
+      const timer = setTimeout(() => {
+        this._exitWaiters = this._exitWaiters.filter((w) => w !== done);
+        resolve(false);
+      }, graceMs);
+      this._exitWaiters.push(done);
+      if (this.exited) done();
+    });
+  }
+
   /** Terminate the process group; SIGKILL after a grace period. */
   async kill(graceMs = 2000) {
     if (!this.child || this.exited) return this.exitInfo;

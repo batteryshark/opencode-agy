@@ -103,6 +103,7 @@ function readBody(req, limit = 64 * 1024 * 1024) {
 export function createApp({ pool, hub = null, store = null } = {}) {
   store = store || pool?.store || new SessionStore();
   pool = pool || new Pool({ store, hub });
+  let chatRequests = 0; // includes unknown session/body, response buffering and streams
 
   async function handleChat(req, res, body) {
     const messages = Array.isArray(body?.messages) ? body.messages : null;
@@ -222,13 +223,28 @@ export function createApp({ pool, hub = null, store = null } = {}) {
         });
       }
       if (req.method === "POST" && (path === "/v1/chat/completions" || path === "/chat/completions")) {
-        let body;
+        chatRequests++;
+        let responseDone = res.writableFinished || res.destroyed;
+        let handlerDone = false;
+        let released = false;
+        const release = () => {
+          if (!released && responseDone && handlerDone) { released = true; chatRequests--; }
+        };
+        const done = () => { responseDone = true; release(); };
+        res.once("finish", done);
+        res.once("close", done);
         try {
-          body = JSON.parse(await readBody(req));
-        } catch (err) {
-          return sendJson(res, err.status || 400, errorBody(`invalid JSON body: ${err.message}`, "invalid_request_error"));
+          let body;
+          try {
+            body = JSON.parse(await readBody(req));
+          } catch (err) {
+            return sendJson(res, err.status || 400, errorBody(`invalid JSON body: ${err.message}`, "invalid_request_error"));
+          }
+          return await handleChat(req, res, body);
+        } finally {
+          handlerDone = true;
+          release();
         }
-        return await handleChat(req, res, body);
       }
       return sendJson(res, 404, errorBody(`no route for ${req.method} ${path}`, "not_found"));
     } catch (err) {
@@ -238,7 +254,13 @@ export function createApp({ pool, hub = null, store = null } = {}) {
     }
   }
 
-  return { handle, pool, store };
+  const checkIdleProcesses = async (now = Date.now()) => {
+    for (const s of pool.sessions.values()) {
+      if (chatRequests) return; // conservative global guard, rechecked after each await
+      await s.checkIdleRelease(now);
+    }
+  };
+  return { handle, pool, store, checkIdleProcesses };
 }
 
 function failure(res, err) {
@@ -406,11 +428,19 @@ export async function startServer({ port = config.port, host = "127.0.0.1" } = {
     server.listen(port, host, resolve);
   });
   const actualPort = server.address().port;
-  const sweep = setInterval(() => {
-    for (const [key, s] of pool.sessions) {
-      if (!s.alive && s.state === "idle" && Date.now() - s.lastUsed > 60 * 60_000) pool.sessions.delete(key);
+  let maintaining = false;
+  const sweep = setInterval(async () => {
+    if (maintaining) return;
+    maintaining = true;
+    try {
+      await app.checkIdleProcesses();
+      for (const [key, s] of pool.sessions) {
+        if (!s.alive && s.state === "idle" && !s.workLeases && Date.now() - s.lastUsed > 60 * 60_000) pool.sessions.delete(key);
+      }
+    } finally {
+      maintaining = false;
     }
-  }, 10 * 60_000);
+  }, 5_000);
   sweep.unref();
   log.info(`listening on http://${host}:${actualPort}/v1`, { agy: config.agyPath, maxProcesses: config.maxProcesses, auth: !!config.token });
   const close = async () => {

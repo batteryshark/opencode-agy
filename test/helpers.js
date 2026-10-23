@@ -129,6 +129,7 @@ export async function startTestApp(processFactory) {
   return {
     base,
     pool,
+    checkIdleProcesses: app.checkIdleProcesses,
     close: () => new Promise((r) => { server.closeAllConnections?.(); server.close(() => r()); }),
   };
 }

@@ -6,6 +6,7 @@
  *   idle     no turn in flight (process may or may not be alive)
  *   running  a turn is in flight and a consumer is reading agy's stdout
  *   parked   agy is blocked inside an MCP tools/call waiting for the harness
+ *   releasing an owned completed child received TERM; retained until actual exit
  *
  * Parking mirrors opencode-claude's bridge pool: when the shim reports a
  * tools/call, the current HTTP response ends with finish_reason "tool_calls"
@@ -94,6 +95,13 @@ export class Session {
     this.lastUsed = Date.now();
     this._lock = Promise.resolve();
     this._listWaiters = [];
+    this.workLeases = 0; // includes begin() queued before the async lock
+    this.completedTurn = null;
+    this.idleRelease = null; // remains claimed on TERM timeout, until actual exit
+    this.toolCalls = new Set();
+    this.activeToolSteps = new Set();
+    this.turnUncertain = false;
+    this.turnSerial = 0;
 
     const saved = this.ephemeral ? null : this.store?.get(this.key);
     this.conversationId = saved?.conversation_id || "";
@@ -131,7 +139,11 @@ export class Session {
    *          systemHash: string, model: string, effort?: string, cwd?: string}} req
    */
   begin(req) {
-    return this._withLock(async () => {
+    this.workLeases++;
+    this.completedTurn = null;
+    const run = this._withLock(async () => {
+      if (this.idleRelease) throw new TurnError("agy is awaiting graceful idle exit; retry shortly", { status: 503, code: "agy_idle_releasing" });
+      this.turnSerial++;
       this.lastUsed = Date.now();
       const results = collectToolResults(req.messages);
       const fp = lastUserFingerprint(req.messages);
@@ -157,9 +169,47 @@ export class Session {
       if (this.ephemeral) await this.stopProcess("ephemeral");
       return this._startTurn(req, fp);
     });
+    // The lease covers even an iterator not yet pulled, and final-yield suspension.
+    return run.then((iter) => {
+      const session = this;
+      let closed = false;
+      const close = () => { if (!closed) { closed = true; session.workLeases--; } };
+      return {
+        [Symbol.asyncIterator]() { return this; },
+        async next(...args) {
+          try { const n = await iter.next(...args); if (n.done) close(); return n; }
+          catch (err) { close(); throw err; }
+        },
+        async return(...args) { try { return await iter.return(...args); } finally { close(); } },
+        async throw(err) { try { return await iter.throw(err); } finally { close(); } },
+      };
+    }, (err) => { this.workLeases--; throw err; });
+  }
+
+  /** Synchronously claim the exact child before any await; new work then gets 503. */
+  async checkIdleRelease(now = Date.now()) {
+    const delay = config.idleReleaseMs;
+    const c = this.completedTurn;
+    const proc = this.proc;
+    if (!delay || !c || c.proc !== proc || c.gen !== this.gen || !this.alive ||
+        this.ephemeral || this.state !== "idle" || this.consumerActive || this.workLeases ||
+        this.pending || this.toolCalls.size || this.activeToolSteps.size || this.draining || this._listWaiters.length ||
+        this.queue?.size !== 0 || this.queue?.waiters.length !== 0 || this.idleRelease ||
+        this.turnUncertain || now - c.at < delay || typeof proc.releaseIdle !== "function") return false;
+    this.idleRelease = proc;
+    this.state = "releasing"; // not an idle/parked LRU eviction candidate on TERM timeout
+    this.completedTurn = null;
+    proc.stopReason = "completed turn idle release";
+    // Never detach a live child on failure, repeat TERM, or use kill()'s escalation.
+    try { return await proc.releaseIdle(); }
+    catch (err) {
+      log.warn("graceful idle release failed; retaining child", { key: this.key, error: String(err.message || err) });
+      return false;
+    }
   }
 
   async _startTurn(req, fp) {
+    this.turnUncertain = false;
     const { messages } = req;
 
     // History rewrites (OpenCode compaction, a new first message) and the optional
@@ -262,6 +312,7 @@ export class Session {
   async _spawn(spec, resumeId) {
     if (this.pool) await this.pool.ensureCapacity(this);
     const gen = ++this.gen;
+    this.activeToolSteps.clear();
     if (this.hub) this.workspace.writeMcp({ dir: this.dir, socketPath: this.hub.socketPath, key: this.key, gen });
     const queue = new AsyncQueue();
     const proc = this.processFactory({
@@ -270,6 +321,17 @@ export class Session {
       effort: spec.effort,
       conversationId: resumeId,
       onItem: (item) => {
+        if (this.gen === gen && item.src === "agy") {
+          const s = item.ev?.step_update;
+          if (s?.step_type === "tool") {
+            const id = s.step_index;
+            if (!Number.isInteger(id) || id < 0) this.turnUncertain = true;
+            else if (s.state === "ACTIVE") this.activeToolSteps.add(id);
+            else if (s.state === "DONE" || s.state === "ERROR") this.activeToolSteps.delete(id);
+            else this.turnUncertain = true;
+            if (s.state === "ERROR") this.turnUncertain = true;
+          }
+        }
         queue.push(item);
         if (item.src === "exit") this._onExit(proc, item.info);
       },
@@ -293,9 +355,14 @@ export class Session {
 
   _onExit(proc, info) {
     if (this.proc !== proc) return;
+    this.completedTurn = null;
+    if (this.idleRelease === proc) this.idleRelease = null;
+    this.toolCalls.clear();
     this.proc = null;
     if (!proc.stopReason) log.warn("agy exited", { key: this.key, ...summarizeExit(info) });
-    if (this.state === "parked") {
+    if (this.state === "releasing") {
+      this.state = "idle";
+    } else if (this.state === "parked") {
       this._clearPending();
       this.state = "idle";
     } else if (this.state === "running" && !this.consumerActive) {
@@ -305,6 +372,9 @@ export class Session {
 
   /** Kill the live process (if any). A parked call dies with it. */
   async stopProcess(reason) {
+    this.completedTurn = null;
+    this.idleRelease = null;
+    this.toolCalls.clear();
     const proc = this.proc;
     this._clearPending();
     if (!proc) return;
@@ -349,6 +419,7 @@ export class Session {
   }
 
   onToolCall(conn, msg) {
+    this.completedTurn = null;
     const reply = (text) => conn.send({ type: "call_result", rid: msg.rid, result: toolResultToMcp(text, true) });
     if (!this.proc || conn.gen !== this.proc.gen) {
       reply("This tool call came from a stale bridge process and was not executed.");
@@ -385,10 +456,13 @@ export class Session {
       createdAt: Date.now(),
       timer: null,
     };
+    this.toolCalls.add(call);
     this.queue.push({ src: "call", call });
   }
 
   onToolCancelled(conn, msg) {
+    this.turnUncertain = true;
+    this.completedTurn = null;
     const p = this.pending;
     if (p && p.conn === conn && p.mcpId === msg.mcpId) {
       log.warn("agy cancelled the parked tool call", { key: this.key, call: p.id, reason: msg.reason });
@@ -398,6 +472,8 @@ export class Session {
   }
 
   onShimDisconnected(conn) {
+    this.turnUncertain = true;
+    this.completedTurn = null;
     if (this.pending && this.pending.conn === conn) this._clearPending();
   }
 
@@ -409,6 +485,8 @@ export class Session {
   _resolvePending(text, isError, { truncate = true } = {}) {
     const p = this.pending;
     if (!p) return;
+    this.toolCalls.delete(p);
+    if (isError) this.turnUncertain = true;
     this._clearPending();
     const out = truncate ? truncateToolOutput(text, config.toolOutputMax) : text;
     p.conn.send({ type: "call_result", rid: p.rid, result: toolResultToMcp(out, isError) });
@@ -422,6 +500,7 @@ export class Session {
       this._resolvePending(results.get(p.id), false);
       return;
     }
+    if (p.subs.some((c) => !results.has(c.id))) this.turnUncertain = true;
     this._resolvePending(combineBatchResults(p.subs, results, config.toolOutputMax), false, { truncate: false });
   }
 
@@ -464,15 +543,17 @@ export class Session {
     }
   }
 
-  async *_consume() {
+  async *_consume(turnSerial = this.turnSerial) {
+    if (turnSerial !== this.turnSerial) return; // an unpulled superseded iterator owns no new stdout
     const proc = this.proc;
     const queue = this.queue;
     const usage = this.usage;
     const gen = this.gen;
-    const mine = () => this.gen === gen;
+    const mine = () => this.gen === gen && this.turnSerial === turnSerial;
     if (!proc || !queue) throw turnError("agy process is not running");
     this.consumerActive = true;
     let finished = false;
+    let successful = false;
     let lastError = "";
     let sawToolActive = false;
     // Release the consumer before the final yields: HTTP callers stop pulling after "finish".
@@ -562,6 +643,7 @@ export class Session {
             if (m.state === "ACTIVE" && harnessToolName(m.name)) sawToolActive = true;
             if (m.state === "ERROR" && m.error) log.debug("agy tool step error", { key: this.key, tool: m.name, error: m.error.slice(0, 200) });
           } else if (m.kind === "step_error") {
+            this.turnUncertain = true;
             lastError = m.text;
           } else if (m.kind === "init") {
             if (m.conversationId && mine() && !this.ephemeral) this.conversationId = m.conversationId;
@@ -572,6 +654,7 @@ export class Session {
               throw turnError(m.error || lastError || `agy turn ended with status ${m.status}`, u);
             }
             finished = true;
+            successful = !!m.conversationId && m.conversationId === this.conversationId && !lastError;
             release();
             if (this.ephemeral && mine() && this.proc === proc) this.stopProcess("ephemeral turn done").catch(() => {});
             yield { type: "finish", reason: "stop", usage: u };
@@ -581,6 +664,9 @@ export class Session {
       }
     } finally {
       release();
+      if (successful && mine() && this.proc === proc && !this.draining && !this.turnUncertain && !this.pending && !this.toolCalls.size && !this.activeToolSteps.size) {
+        this.completedTurn = { proc, gen, at: Date.now() };
+      }
       if (!finished && mine() && this.state === "running" && this.proc === proc) {
         // Consumer abandoned mid-turn (client abort or error): nobody can resume it.
         this.stopProcess("turn abandoned").catch(() => {});
